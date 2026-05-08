@@ -1,0 +1,9 @@
+{
+  "name": "rundeck",
+  "version": "1.0.0",
+  "description": "A Claude Code plugin for Rundeck.",
+  "author": {
+    "name": "Martin Stone",
+    "email": "martin@pagerduty.com"
+  }
+}

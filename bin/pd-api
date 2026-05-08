@@ -1,0 +1,509 @@
+#!/usr/bin/env node
+/**
+ * pd-api.mjs
+ *
+ * Tiny dependency-free PagerDuty REST API helper for Claude Code plugins/scripts.
+ *
+ * Goals:
+ * - No npm install
+ * - Reads common PagerDuty token env vars
+ * - Handles PagerDuty REST auth header conventions
+ * - Provides raw request mode and auto-paginated fetch mode
+ * - Emits JSON to stdout
+ *
+ * Examples:
+ *   node pd-api.mjs request GET /users '{"limit": 10}'
+ *   node pd-api.mjs fetch GET /users '{"query": "alice"}'
+ *   node pd-api.mjs request POST /incidents '{}' '{"incident": {...}}'
+ *
+ * Environment:
+ *   PAGERDUTY_API_TOKEN, PAGERDUTY_TOKEN, PD_API_TOKEN, PAGERDUTY_API_KEY, PD_TOKEN
+ *   PAGERDUTY_API_URL or PAGERDUTY_URL, defaults to https://api.pagerduty.com
+ *   PD_API_DEBUG=1 for basic stderr debug output
+ */
+
+const DEFAULT_BASE_URL = "https://api.pagerduty.com";
+const DEFAULT_LIMIT = 25;
+const MAX_429_RETRIES = Number.parseInt(
+  process.env.PD_API_MAX_429_RETRIES || "6",
+  10
+);
+
+function getToken() {
+  return (
+    process.env.PAGERDUTY_API_TOKEN ||
+    process.env.PAGERDUTY_TOKEN ||
+    process.env.PD_API_TOKEN ||
+    process.env.PAGERDUTY_API_KEY ||
+    process.env.PD_TOKEN ||
+    ""
+  );
+}
+
+function getBaseUrl() {
+  return (
+    process.env.PAGERDUTY_API_URL ||
+    process.env.PAGERDUTY_URL ||
+    DEFAULT_BASE_URL
+  );
+}
+
+function isLegacyToken(token) {
+  return /^[0-9a-zA-Z_\-+/=]{20}$/.test(token);
+}
+
+function isOldBearerToken(token) {
+  return /^[0-9a-fA-F]{64}$/.test(token);
+}
+
+function isBearerToken(token) {
+  // PagerDuty token formats have changed over time.
+  // Treat anything not matching the old 20-char REST API token as bearer-style.
+  return isOldBearerToken(token) || !isLegacyToken(token);
+}
+
+function authHeaderForToken(token) {
+  if (!token) {
+    throw new Error(
+      "Missing PagerDuty token. Set PAGERDUTY_API_TOKEN, PAGERDUTY_TOKEN, PD_API_TOKEN, PAGERDUTY_API_KEY, or PD_TOKEN."
+    );
+  }
+
+  if (isBearerToken(token)) {
+    return `Bearer ${token}`;
+  }
+
+  if (isLegacyToken(token)) {
+    return `Token token=${token}`;
+  }
+
+  throw new Error("Invalid PagerDuty token format.");
+}
+
+function endpointIdentifier(endpoint) {
+  const path = endpoint.split("?")[0].replace(/^\/+/, "");
+
+  if (/users\/P.*\/sessions/.test(path)) {
+    return "user_sessions";
+  }
+
+  if (/(^|\/)event_orchestrations(\/|$)/.test(path)) {
+    return "orchestrations";
+  }
+
+  const parts = path.split("/").filter(Boolean);
+  return parts[parts.length - 1] || "data";
+}
+
+function parseJsonArg(value, fallback = {}) {
+  if (!value) return fallback;
+
+  try {
+    return JSON.parse(value);
+  } catch (err) {
+    throw new Error(`Expected valid JSON argument but got: ${value}`);
+  }
+}
+
+function toQueryString(params = {}) {
+  const search = new URLSearchParams();
+
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === null) continue;
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        search.append(key, String(item));
+      }
+    } else {
+      search.set(key, String(value));
+    }
+  }
+
+  const qs = search.toString();
+  return qs ? `?${qs}` : "";
+}
+
+function buildUrl(endpoint, params = {}) {
+  const baseUrl = getBaseUrl().replace(/\/+$/, "");
+  const cleanEndpoint = endpoint.startsWith("/")
+    ? endpoint
+    : `/${endpoint}`;
+
+  return `${baseUrl}${cleanEndpoint}${toQueryString(params)}`;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function sleepMsForRateLimit(response, retryNumber) {
+  const reset = response.headers.get("ratelimit-reset");
+  const retryAfter = response.headers.get("retry-after");
+
+  if (retryAfter && !Number.isNaN(Number(retryAfter))) {
+    return Math.max(1000, Number(retryAfter) * 1000);
+  }
+
+  if (reset && !Number.isNaN(Number(reset))) {
+    return Math.max(1000, Number(reset) * 1000);
+  }
+
+  // fallback exponential backoff
+  return Math.min(30000, 1000 * Math.pow(2, retryNumber + 1));
+}
+
+function debug(...args) {
+  if (process.env.PD_API_DEBUG) {
+    console.error("[pd-api]", ...args);
+  }
+}
+
+async function request({
+  endpoint,
+  method = "GET",
+  params = {},
+  data,
+  headers = {},
+  retryNumber = 0,
+}) {
+  const token = getToken();
+  const upperMethod = method.toUpperCase();
+
+  const requestHeaders = {
+    Accept: "application/vnd.pagerduty+json;version=2",
+    Authorization: authHeaderForToken(token),
+    "Content-Type": "application/json",
+    "User-Agent": "pagerduty-claude-plugin-helper/0.1",
+    "X-PagerDuty-Client": "pagerduty-claude-plugin-helper 0.1",
+    ...headers,
+  };
+
+  const url = buildUrl(endpoint, params);
+
+  debug(upperMethod, url);
+
+  const response = await fetch(url, {
+    method: upperMethod,
+    headers: requestHeaders,
+    body:
+      data === undefined || upperMethod === "GET"
+        ? undefined
+        : JSON.stringify(data),
+  });
+
+  const text = await response.text();
+  const parsed = text ? safeJsonParse(text) : {};
+
+  if (response.status === 429 && retryNumber < MAX_429_RETRIES) {
+    const waitMs = sleepMsForRateLimit(response, retryNumber);
+
+    debug(`rate limited; retrying in ${waitMs}ms`);
+
+    await sleep(waitMs);
+
+    return request({
+      endpoint,
+      method,
+      params,
+      data,
+      headers,
+      retryNumber: retryNumber + 1,
+    });
+  }
+
+  if (!response.ok) {
+    const error = new Error(formatPagerDutyError(response, parsed));
+    error.status = response.status;
+    error.response = parsed;
+    throw error;
+  }
+
+  return parsed;
+}
+
+function safeJsonParse(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { raw: text };
+  }
+}
+
+function formatPagerDutyError(response, body) {
+  const status = `${response.status} ${response.statusText}`;
+
+  const err = body?.error;
+
+  if (!err) {
+    return `${status}: ${JSON.stringify(body)}`;
+  }
+
+  if (Array.isArray(err.errors) && err.errors.length > 0) {
+    return `${status}: ${err.code || ""} ${err.message || ""} - ${err.errors.join(", ")}`.trim();
+  }
+
+  if (typeof err.message === "string") {
+    return `${status}: ${err.message}`;
+  }
+
+  return `${status}: ${JSON.stringify(err)}`;
+}
+
+function extractItems(page, endpoint) {
+  const identifier = endpointIdentifier(endpoint);
+
+  if (page && Array.isArray(page[identifier])) {
+    return page[identifier];
+  }
+
+  if (page && Array.isArray(page.data)) {
+    return page.data;
+  }
+
+  // Some endpoints return a singular object.
+  return [page];
+}
+
+async function fetchAll({
+  endpoint,
+  method = "GET",
+  params = {},
+  data,
+  headers = {},
+  fetchLimit,
+}) {
+  const upperMethod = method.toUpperCase();
+  const isGet = upperMethod === "GET";
+  const limit = Number(params.limit || DEFAULT_LIMIT);
+
+  let requestParams = isGet
+    ? { total: true, limit, ...params }
+    : { ...params };
+
+  let firstPage = await request({
+    endpoint,
+    method: upperMethod,
+    params: requestParams,
+    data,
+    headers,
+  });
+
+  let items = extractItems(firstPage, endpoint);
+
+  if (fetchLimit && items.length >= fetchLimit) {
+    return items.slice(0, fetchLimit);
+  }
+
+  // Classic pagination with total
+  if (firstPage.more && firstPage.total && !firstPage.last) {
+    for (
+      let offset = limit;
+      offset < firstPage.total &&
+      (!fetchLimit || items.length < fetchLimit);
+      offset += limit
+    ) {
+      const pageParams = { ...requestParams, offset };
+
+      const page = await request({
+        endpoint,
+        method: upperMethod,
+        params: pageParams,
+        data,
+        headers,
+      });
+
+      items = items.concat(extractItems(page, endpoint));
+    }
+
+    return fetchLimit ? items.slice(0, fetchLimit) : items;
+  }
+
+  // next_cursor pagination
+  if (firstPage.next_cursor) {
+    let nextCursor = firstPage.next_cursor;
+
+    while (
+      nextCursor &&
+      (!fetchLimit || items.length < fetchLimit)
+    ) {
+      const pageParams = {
+        ...requestParams,
+        cursor: nextCursor,
+      };
+
+      const page = await request({
+        endpoint,
+        method: upperMethod,
+        params: pageParams,
+        data,
+        headers,
+      });
+
+      items = items.concat(extractItems(page, endpoint));
+      nextCursor = page.next_cursor;
+    }
+
+    return fetchLimit ? items.slice(0, fetchLimit) : items;
+  }
+
+  // Analytics-style pagination
+  if (firstPage.last && firstPage.more) {
+    let last = firstPage.last;
+    let more = Boolean(firstPage.more);
+
+    while (
+      last &&
+      more &&
+      (!fetchLimit || items.length < fetchLimit)
+    ) {
+      const pageData = {
+        ...(data || {}),
+        starting_after: last,
+      };
+
+      const page = await request({
+        endpoint,
+        method: upperMethod,
+        params: requestParams,
+        data: pageData,
+        headers,
+      });
+
+      items = items.concat(extractItems(page, endpoint));
+
+      last = page.last;
+      more = Boolean(page.more);
+    }
+
+    return fetchLimit ? items.slice(0, fetchLimit) : items;
+  }
+
+  // Pagination without total
+  if (firstPage.more) {
+    let more = Boolean(firstPage.more);
+    let offset = Number(requestParams.offset || 0);
+
+    while (
+      more &&
+      (!fetchLimit || items.length < fetchLimit)
+    ) {
+      offset += limit;
+
+      const pageParams = {
+        ...requestParams,
+        offset,
+      };
+
+      const page = await request({
+        endpoint,
+        method: upperMethod,
+        params: pageParams,
+        data,
+        headers,
+      });
+
+      items = items.concat(extractItems(page, endpoint));
+      more = Boolean(page.more);
+    }
+
+    return fetchLimit ? items.slice(0, fetchLimit) : items;
+  }
+
+  return fetchLimit ? items.slice(0, fetchLimit) : items;
+}
+
+function printJson(value) {
+  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+}
+
+function usage(exitCode = 2) {
+  console.error(`
+Usage:
+  pd-api request METHOD ENDPOINT [PARAMS_JSON] [BODY_JSON] [HEADERS_JSON]
+  pd-api fetch   METHOD ENDPOINT [PARAMS_JSON] [BODY_JSON] [HEADERS_JSON] [FETCH_LIMIT]
+
+Examples:
+  pd-api request GET /users '{"limit":10}'
+  pd-api fetch GET /users '{"query":"alice"}'
+  pd-api request POST /incidents '{}' '{"incident":{"type":"incident","title":"Test"}}'
+`);
+
+  process.exit(exitCode);
+}
+
+async function main() {
+  const [
+    mode,
+    method,
+    endpoint,
+    paramsJson,
+    bodyJson,
+    headersJson,
+    fetchLimitRaw,
+  ] = process.argv.slice(2);
+
+  if (
+    !mode ||
+    !method ||
+    !endpoint ||
+    !["request", "fetch"].includes(mode)
+  ) {
+    usage();
+  }
+
+  const params = parseJsonArg(paramsJson, {});
+  const data = bodyJson
+    ? parseJsonArg(bodyJson, undefined)
+    : undefined;
+
+  const headers = parseJsonArg(headersJson, {});
+
+  const fetchLimit = fetchLimitRaw
+    ? Number.parseInt(fetchLimitRaw, 10)
+    : undefined;
+
+  if (fetchLimitRaw && Number.isNaN(fetchLimit)) {
+    throw new Error(
+      `FETCH_LIMIT must be a number; got ${fetchLimitRaw}`
+    );
+  }
+
+  if (mode === "request") {
+    const result = await request({
+      endpoint,
+      method,
+      params,
+      data,
+      headers,
+    });
+
+    printJson(result);
+    return;
+  }
+
+  if (mode === "fetch" && method.toUpperCase() !== "GET") {
+    throw new Error("Fetch mode only supports GET requests");
+  }
+
+  const result = await fetchAll({
+    endpoint,
+    method,
+    params,
+    data,
+    headers,
+    fetchLimit,
+  });
+
+  printJson(result);
+}
+
+main().catch(err => {
+  console.error(err.message || String(err));
+
+  if (process.env.PD_API_DEBUG && err.stack) {
+    console.error(err.stack);
+  }
+
+  process.exit(err.status || 1);
+});

@@ -1,5 +1,5 @@
 ---
-name: rundeck-job
+name: rundeck
 description: Generate, import, and execute Rundeck job YAML using Rundeck CLI.
 ---
 
@@ -19,6 +19,8 @@ Rules:
     - RD_URL
     - RD_TOKEN
     - RD_PROJECT
+  - For any Rundeck-related request, determine the appropriate `rd` CLI command to accomplish the task and execute it. If the request is ambiguous, ask the user for clarification before proceeding. If there's no `rd` command available, you can use the Rundeck REST API directly.
+  - When adding workflow steps to Rundeck jobs for communicating with PagerDuty, use the available PagerDuty plugins within Rundeck. See if the project key storage contains a PagerDuty API Key for use with PagerDuty from Rundeck. If none is found, ask the user to provide the path to a key in Rundeck's key storage containing a valid PagerDuty API key, and use that in the workflow step configuration. If they can't provide a key storage path, you can offer to add the PagerDuty key from the environment variable `PAGERDUTY_API_KEY` if it is set, or ask them to provide the value of the PagerDuty API key directly in the conversation (but do not store it in an environment variable or show it in the conversation). Use the provided PagerDuty API key in the workflow step configuration for communicating with PagerDuty.
 
 Helpers:
   - Rundeck Job YAML Reference:
