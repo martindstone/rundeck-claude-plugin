@@ -114,8 +114,9 @@ You can export the required variables in your current shell session:
 
 ```bash
 export RD_URL="https://rundeck.example.com"
-export RD_TOKEN="your-api-token"
+export RD_TOKEN="your-rundeck-api-token"
 export RD_PROJECT="my-project"
+export PD_API_TOKEN="your-pagerduty-api-token"
 ```
 
 If you want them to persist, add the exports to your shell profile such as `~/.zshrc` or `~/.bashrc`.
